@@ -32,6 +32,8 @@ These are standalone indicators, not strategies. Use them for chart signals and 
 - `WickCE_Setup1_Indicator.pine`: Setup 1, a direct limit at the HTF wick CE.
 - `WickCE_Setup2_Indicator.pine`: Setup 2, a chart-timeframe rejection block at the HTF CE.
 
+**Early mode** (setting: "Early mode: show HTF wick CE while the HTF candle is forming", on by default) detects and draws the HTF wick CE live, as soon as the forming HTF candle has a qualifying wick. The CE is re-anchored if the HTF candle makes a new extreme and is confirmed when the HTF candle closes. Turn it off to use completed HTF candles only.
+
 Each indicator shows:
 - A **BUY / SELL LIMIT** label when the order is armed.
 - A **BUY / SELL** signal when the entry fills.

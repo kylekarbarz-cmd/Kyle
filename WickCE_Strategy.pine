@@ -45,6 +45,8 @@ useFvgFilt = input.bool(true, "Exclude wick that begins an unfilled imbalance", 
 useEqFilt  = input.bool(true, "Exclude wick forming equal highs / lows", group = grpW)
 eqTol      = input.float(1.0, "Equal swing tolerance (points)", minval = 0, group = grpW)
 maxHtfAge  = input.int(6, "Setup expires after N HTF candles", minval = 1, group = grpW)
+liveWick   = input.bool(true, "Early mode: show HTF wick CE while the HTF candle is forming", group = grpW,
+     tooltip = "ON: the wick is detected and drawn live as soon as it qualifies (sweep + close back inside + size), so you can catch the move early. The CE can move if the HTF candle makes a new extreme, and is re-measured (confirmed) when the HTF candle closes. OFF: only completed HTF candles are used.")
 
 grpL = "Engineered liquidity (chart timeframe)"
 pivLen     = input.int(3, "Swing pivot strength (bars each side)", minval = 1, group = grpL)
@@ -102,9 +104,9 @@ const int S_DONE  = 5   // filled, invalidated or expired
 f_htf() =>
     priorHi = ta.highest(high, sweepLen)[1]
     priorLo = ta.lowest(low, sweepLen)[1]
-    [open[1], high[1], low[1], close[1], time[1], priorHi[1], priorLo[1], high[3], low[3], time[3]]
+    [open[1], high[1], low[1], close[1], time[1], priorHi[1], priorLo[1], high[3], low[3], time[3], priorHi, priorLo]
 
-[hO, hH, hL, hC, hT, hPH, hPL, h3H, h3L, h3T] = request.security(syminfo.tickerid, htfTf, f_htf(), lookahead = barmerge.lookahead_on)
+[hO, hH, hL, hC, hT, hPH, hPL, h3H, h3L, h3T, cPH, cPL] = request.security(syminfo.tickerid, htfTf, f_htf(), lookahead = barmerge.lookahead_on)
 newHtf = not na(hT) and hT != nz(hT[1])
 
 // ───────────────────────────── Daily context ─────────────────────────────
@@ -180,6 +182,7 @@ type Setup
     line   lCe
     line   lExt
     line   lTgt
+    label  lbl
 
 method alive(Setup s) =>
     s.state >= S_LIQ and s.state <= S_ORDER
@@ -209,7 +212,7 @@ method extendLines(Setup s) =>
 
 f_newSetup(int d, int wt, float beg, float ext, float tgt) =>
     Setup s = Setup.new(dir = d, state = S_LIQ, wickTime = wt, startTime = time, startBar = bar_index,
-         beg = beg, ce = (beg + ext) / 2, ext = ext, target = tgt, fvgChecked = not useFvgFilt,
+         beg = beg, ce = (beg + ext) / 2, ext = ext, target = tgt, fvgChecked = not useFvgFilt or liveWick,
          id = (d == 1 ? "Long " : "Short ") + str.tostring(bar_index), note = "Waiting for liquidity")
     if showLevels
         color c = d == 1 ? colBull : colBear
@@ -218,7 +221,7 @@ f_newSetup(int d, int wt, float beg, float ext, float tgt) =>
         s.lBeg := line.new(wt, beg, time, beg, xloc = xloc.bar_time, color = color.new(c, 60), width = 1)
         if targetMode == TGT_PD
             s.lTgt := line.new(time, tgt, time, tgt, xloc = xloc.bar_time, color = color.new(c, 30), width = 1, style = line.style_dotted)
-        label.new(wt, ext, "HTF wick CE " + str.tostring(s.ce, format.mintick), xloc = xloc.bar_time,
+        s.lbl := label.new(wt, ext, (liveWick ? "Live HTF wick CE " : "HTF wick CE ") + str.tostring(s.ce, format.mintick), xloc = xloc.bar_time,
              style = d == 1 ? label.style_label_up : label.style_label_down, color = color.new(c, 75),
              textcolor = chart.fg_color, size = size.tiny)
     s
@@ -260,8 +263,9 @@ method planOrder(Setup s, float entryPx, float stopPx, string route) =>
 method step(Setup s, bool canTrade) =>
     if s.alive()
         int d = s.dir
-        bool through  = d == -1 ? high > s.ext : low < s.ext
-        bool ceTouch  = d == -1 ? high >= s.ce : low <= s.ce
+        bool fresh    = bar_index == s.startBar
+        bool through  = not fresh and (d == -1 ? high > s.ext : low < s.ext)
+        bool ceTouch  = not fresh and (d == -1 ? high >= s.ce : low <= s.ce)
         bool tgtTaken = targetMode == TGT_PD and (d == -1 ? low <= s.target : high >= s.target)
 
         // HTF bookkeeping: age + unfilled-imbalance-origin filter
@@ -352,34 +356,80 @@ method step(Setup s, bool canTrade) =>
         s.extendLines()
     s
 
-// ───────────────────────────── Candidate detection on HTF close ─────────────────────────────
+// ───────────────────────────── Candidate detection ─────────────────────────────
 var Setup bear = Setup.new(dir = -1)
 var Setup bull = Setup.new(dir = 1)
 
-if newHtf and not na(hPH) and not na(pdH)
-    float rng = hH - hL
-    // bearish upper wick
-    float bBeg = math.max(hO, hC)
-    float bW   = hH - bBeg
-    bool bOrig = originMode == "Any qualified wick" or (hH > hPH and hC < hPH)
-    bool bEq   = useEqFilt and math.abs(hH - hPH) <= eqTol
-    bool bTgt  = targetMode == TGT_R or (dayLo > pdL and pdL < (bBeg + hH) / 2)
-    if allowShort and rng > 0 and bW >= minWickPts and bW / rng * 100 >= minWickPct and bOrig and not bEq and bTgt
-        if bear.state != S_ORDER and bear.state != S_LTF
-            if bear.alive()
-                bear.kill("Replaced by newer wick")
-            bear := f_newSetup(-1, hT, bBeg, hH, pdL)
-    // bullish lower wick
-    float uBeg = math.min(hO, hC)
-    float uW   = uBeg - hL
-    bool uOrig = originMode == "Any qualified wick" or (hL < hPL and hC > hPL)
-    bool uEq   = useEqFilt and math.abs(hL - hPL) <= eqTol
-    bool uTgt  = targetMode == TGT_R or (dayHi < pdH and pdH > (uBeg + hL) / 2)
-    if allowLong and rng > 0 and uW >= minWickPts and uW / rng * 100 >= minWickPct and uOrig and not uEq and uTgt
-        if bull.state != S_ORDER and bull.state != S_LTF
-            if bull.alive()
-                bull.kill("Replaced by newer wick")
-            bull := f_newSetup(1, hT, uBeg, hL, pdH)
+// Measure an HTF candle's upper (bearish) or lower (bullish) wick and apply the wick filters.
+f_qualify(int d, float o, float h, float l, float c, float priorHi, float priorLo) =>
+    float beg   = d == -1 ? math.max(o, c) : math.min(o, c)
+    float ext   = d == -1 ? h : l
+    float w     = math.abs(ext - beg)
+    float rng   = h - l
+    float lvl   = d == -1 ? priorHi : priorLo
+    bool  orig  = originMode == "Any qualified wick" or (d == -1 ? (h > lvl and c < lvl) : (l < lvl and c > lvl))
+    bool  eq    = useEqFilt and math.abs(ext - lvl) <= eqTol
+    float ce    = (beg + ext) / 2
+    bool  tgt   = targetMode == TGT_R or (d == -1 ? (dayLo > pdL and pdL < ce) : (dayHi < pdH and pdH > ce))
+    bool  dirOk = d == -1 ? allowShort : allowLong
+    bool  ok    = dirOk and not na(lvl) and rng > 0 and w >= minWickPts and w / rng * 100 >= minWickPct and orig and not eq and tgt
+    [beg, ext, ok]
+
+// A setup that is idle, waiting for liquidity or qualified can be replaced by a newer wick.
+method free(Setup s) =>
+    s.state < S_LTF or s.state == S_DONE
+
+// Final measurement once the HTF candle that produced a live wick has closed.
+method remeasure(Setup s, float newBeg) =>
+    if newBeg != s.beg
+        s.beg := newBeg
+        s.ce  := (newBeg + s.ext) / 2
+        if not na(s.lCe)
+            s.lCe.set_y1(s.ce)
+            s.lCe.set_y2(s.ce)
+            s.lBeg.set_y1(newBeg)
+            s.lBeg.set_y2(newBeg)
+    if not na(s.lbl)
+        s.lbl.set_text("HTF wick CE " + str.tostring(s.ce, format.mintick) + " (confirmed)")
+    s
+
+// Create, re-anchor or confirm the setup for one direction from an HTF candle (live or closed).
+f_track(Setup s, int d, int wt, float o, float h, float l, float c, float priorHi, float priorLo, bool isClose) =>
+    [beg, ext, ok] = f_qualify(d, o, h, l, c, priorHi, priorLo)
+    Setup res = s
+    if isClose and liveWick and s.wickTime == wt and s.alive()
+        if s.free()
+            if not ok
+                s.kill("HTF candle closed without a qualifying wick")
+            else if ext == s.ext
+                s.remeasure(beg)
+    else if ok and s.free() and not (s.wickTime == wt and s.ext == ext)
+        if s.alive()
+            s.kill("Replaced by newer wick")
+        res := f_newSetup(d, wt, beg, ext, d == -1 ? pdL : pdH)
+    res
+
+// 1) completed HTF candle (confirms live wicks, or detects wicks in close-only mode)
+if newHtf and not na(pdH)
+    bear := f_track(bear, -1, hT, hO, hH, hL, hC, hPH, hPL, true)
+    bull := f_track(bull,  1, hT, hO, hH, hL, hC, hPH, hPL, true)
+
+// 2) forming HTF candle, rebuilt from chart bars so it does not repaint
+htfOpenT = time(htfTf)
+var float fO = na
+var float fH = na
+var float fL = na
+if na(fO) or htfOpenT != nz(htfOpenT[1])
+    fO := open
+    fH := high
+    fL := low
+else
+    fH := math.max(fH, high)
+    fL := math.min(fL, low)
+
+if liveWick and not na(htfOpenT) and not na(pdH)
+    bear := f_track(bear, -1, htfOpenT, fO, fH, fL, close, cPH, cPL, false)
+    bull := f_track(bull,  1, htfOpenT, fO, fH, fL, close, cPH, cPL, false)
 
 // ───────────────────────────── Run state machines ─────────────────────────────
 bool baseOk = inSess and not dayLocked and strategy.position_size == 0
