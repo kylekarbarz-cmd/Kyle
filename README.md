@@ -26,3 +26,17 @@
 
 The strategy does not code the "competing nearer draw" check or any SMT confluence. Review those by eye.
 Backtest results are illustrative and do not establish a win rate.
+
+## Signal indicators (one per setup)
+These are standalone indicators, not strategies. Use them for chart signals and alerts.
+- `WickCE_Setup1_Indicator.pine`: Setup 1, a direct limit at the HTF wick CE.
+- `WickCE_Setup2_Indicator.pine`: Setup 2, a chart-timeframe rejection block at the HTF CE.
+
+Each indicator shows:
+- A **BUY / SELL LIMIT** label when the order is armed.
+- A **BUY / SELL** signal when the entry fills.
+- A green take-profit box and a red stop-loss box.
+- A **TP / SL / BE** label with the R result when the trade closes.
+- A stats table with wins, losses, win % and net R.
+
+Alerts: in TradingView, choose *Create alert → condition: the indicator → "Any alert() function call"*. You can also pick one of the BUY / SELL / Take profit / Stop loss conditions.

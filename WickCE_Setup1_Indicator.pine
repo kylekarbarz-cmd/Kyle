@@ -1,0 +1,462 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Wick CE Setup 1 - Direct CE Entry
+//  Wick CE + Engineered Liquidity model (MarketNQ course) - signals indicator
+//
+//  SETUP 1: qualified HTF rejection wick + engineered liquidity before its CE
+//           -> limit at the HTF wick CE, stop beyond the HTF wick extreme,
+//           take profit at the untaken prior-day extreme (or fixed R).
+//
+//  Shows BUY / SELL signals when the limit entry fills, with the entry, stop
+//  loss and take profit drawn as a position box, and marks TP / SL hits.
+//  Educational tool. Signals and stats do not establish a win rate.
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("Wick CE Setup 1 - Direct CE Entry", shorttitle = "WickCE S1", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 2000)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+const string TGT_PD = "Prior day extreme"
+const string TGT_R  = "Fixed R multiple"
+
+grpM = "Model"
+htfTf      = input.timeframe("240", "HTF location timeframe (wick)", group = grpM, tooltip = "Timeframe of the rejection wick (H4 by default). Must be higher than the chart (execution) timeframe.")
+biasMode   = input.string("Daily context", "Direction filter", options = ["Daily context", "Both directions", "Long only", "Short only"], group = grpM,
+     tooltip = "Daily context: prior-high sweep + close back inside = bearish; prior-low sweep + close back inside = bullish; close beyond a prior extreme = continuation.")
+targetMode = input.string(TGT_PD, "Take profit (draw on liquidity)", options = [TGT_PD, TGT_R], group = grpM,
+     tooltip = "Prior day extreme: sells target the untaken prior-day low, buys the untaken prior-day high. Setup is skipped if that destination already traded.")
+fixedR     = input.float(4.0, "Fixed R take profit", minval = 0.5, step = 0.5, group = grpM)
+minRR      = input.float(2.0, "Minimum planned R for a signal", minval = 0, step = 0.25, group = grpM)
+
+grpW = "HTF wick qualification"
+originMode = input.string("Sweep required", "Wick origin", options = ["Sweep required", "Any qualified wick"], group = grpW,
+     tooltip = "Sweep required: the wick must take out the highest high / lowest low of the previous N HTF candles and close back inside.")
+sweepLen   = input.int(6, "Sweep lookback (HTF candles)", minval = 1, group = grpW)
+minWickPts = input.float(10.0, "Min wick size (points)", minval = 0, group = grpW)
+minWickPct = input.float(30.0, "Min wick % of candle range", minval = 0, maxval = 100, group = grpW)
+useFvgFilt = input.bool(true, "Exclude wick that begins an unfilled imbalance", group = grpW,
+     tooltip = "Waits two HTF candles after the wick and discards it if the wick candle became the first candle of a fair value gap.")
+useEqFilt  = input.bool(true, "Exclude wick forming equal highs / lows", group = grpW)
+eqTol      = input.float(1.0, "Equal swing tolerance (points)", minval = 0, group = grpW)
+maxHtfAge  = input.int(6, "Setup expires after N HTF candles", minval = 1, group = grpW)
+
+grpL = "Engineered liquidity (chart timeframe)"
+pivLen     = input.int(3, "Swing pivot strength (bars each side)", minval = 1, group = grpL)
+minLiq     = input.int(2, "Min swing points before CE (grouped liquidity)", minval = 1, group = grpL)
+proxPts    = input.float(2.0, "Proximity exclusion: pool within X points of CE", minval = 0, group = grpL,
+     tooltip = "A pool this close to CE treats the midpoint as already mitigated and the setup is discarded.")
+liqMaxDist = input.float(60.0, "Max pool distance from CE (points)", minval = 1, group = grpL)
+
+
+
+grpR = "Stop loss & orders"
+stopBuf    = input.float(1.0, "Stop buffer beyond structure (points)", minval = 0, group = grpR)
+maxStopPts = input.float(60.0, "Max stop distance (points, 0 = off)", minval = 0, group = grpR)
+orderExp   = input.int(48, "Cancel unfilled limit after N bars", minval = 1, group = grpR)
+beAtR      = input.float(0.0, "Move stop to break-even at R (0 = off)", minval = 0, step = 0.25, group = grpR)
+
+grpD = "Session & discipline"
+useSess    = input.bool(true, "Only signal inside session", group = grpD)
+sessStr    = input.session("0700-1600", "Session", group = grpD)
+sessTz     = input.string("America/New_York", "Session timezone", group = grpD)
+maxTrades  = input.int(2, "Max signals per day", minval = 1, group = grpD)
+maxLosses  = input.int(2, "Stop for the day after N losses", minval = 1, group = grpD)
+
+grpV = "Visuals"
+showLevels = input.bool(true, "Draw HTF wick beginning / CE / extreme", group = grpV)
+showPD     = input.bool(true, "Plot prior-day high / low", group = grpV)
+showTable  = input.bool(true, "Status & stats table", group = grpV)
+colBear    = input.color(color.new(#f23645, 0), "Sell / bearish", group = grpV)
+colBull    = input.color(color.new(#089981, 0), "Buy / bullish", group = grpV)
+colLiq     = input.color(color.new(#ff9800, 0), "Liquidity", group = grpV)
+
+if barstate.isfirst and timeframe.in_seconds(htfTf) <= timeframe.in_seconds()
+    runtime.error("HTF location timeframe must be higher than the chart timeframe.")
+
+// ───────────────────────────── Constants ─────────────────────────────
+const int S_LIQ   = 1   // waiting for engineered liquidity
+const int S_READY = 2   // qualified
+const int S_LTF   = 3   // setup 2: CE reached, waiting for chart-TF rejection
+const int S_ORDER = 4   // limit order pending
+const int S_TRADE = 5   // in trade
+const int S_DONE  = 6   // finished / invalidated
+
+// ───────────────────────────── HTF data (non-repainting) ─────────────────────────────
+f_htf() =>
+    priorHi = ta.highest(high, sweepLen)[1]
+    priorLo = ta.lowest(low, sweepLen)[1]
+    [open[1], high[1], low[1], close[1], time[1], priorHi[1], priorLo[1], high[3], low[3], time[3]]
+
+[hO, hH, hL, hC, hT, hPH, hPL, h3H, h3L, h3T] = request.security(syminfo.tickerid, htfTf, f_htf(), lookahead = barmerge.lookahead_on)
+newHtf = not na(hT) and hT != nz(hT[1])
+
+// ───────────────────────────── Daily context ─────────────────────────────
+[pdH, pdL, pdC, ppH, ppL] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1], high[2], low[2]], lookahead = barmerge.lookahead_on)
+
+bearSweep = pdH > ppH and pdC < ppH
+bullSweep = pdL < ppL and pdC > ppL
+bullCont  = pdC > ppH
+bearCont  = pdC < ppL
+int dailyBias = bearSweep and not bullSweep ? -1 : bullSweep and not bearSweep ? 1 : bullCont ? 1 : bearCont ? -1 : 0
+
+allowLong  = biasMode == "Both directions" or biasMode == "Long only"  or (biasMode == "Daily context" and dailyBias == 1)
+allowShort = biasMode == "Both directions" or biasMode == "Short only" or (biasMode == "Daily context" and dailyBias == -1)
+
+// ───────────────────────────── Stats (object so methods can update it) ─────────────────────────────
+type Stats
+    int   tradesToday = 0
+    int   lossesToday = 0
+    int   wins        = 0
+    int   losses      = 0
+    int   scratches   = 0
+    float netR        = 0.0
+
+var Stats st = Stats.new()
+
+newDay = ta.change(time("D")) != 0
+var float dayHi = na
+var float dayLo = na
+if newDay
+    dayHi := high
+    dayLo := low
+    st.tradesToday := 0
+    st.lossesToday := 0
+else
+    dayHi := math.max(nz(dayHi, high), high)
+    dayLo := math.min(nz(dayLo, low), low)
+
+inSess = not useSess or not na(time(timeframe.period, sessStr, sessTz))
+
+// ───────────────────────────── Chart-TF swings ─────────────────────────────
+ph   = ta.pivothigh(high, pivLen, pivLen)
+pl   = ta.pivotlow(low, pivLen, pivLen)
+pivT = time[pivLen]
+
+// ───────────────────────────── Setup object ─────────────────────────────
+type Setup
+    int    dir
+    int    state      = 6
+    int    wickTime
+    int    startTime
+    int    startBar
+    float  beg
+    float  ce
+    float  ext
+    float  target
+    int    liqCount   = 0
+    bool   fvgChecked = false
+    int    htfAge     = 0
+    int    reachBar
+    int    orderBar
+    int    fillBar
+    int    exitBar
+    float  entry
+    float  stop
+    float  tp
+    float  risk
+    bool   beDone     = false
+    string result     = ""
+    string note       = ""
+    line   lBeg
+    line   lCe
+    line   lExt
+    line   lTgt
+    line   lEntry
+    line   lSL
+    line   lTP
+    box    bxWin
+    box    bxLoss
+
+method alive(Setup s) =>
+    s.state >= S_LIQ and s.state <= S_TRADE
+
+method busy(Setup s) =>
+    s.state == S_ORDER or s.state == S_TRADE
+
+method freezeLevels(Setup s) =>
+    if not na(s.lCe)
+        s.lCe.set_x2(time)
+        s.lBeg.set_x2(time)
+        s.lExt.set_x2(time)
+    if not na(s.lTgt)
+        s.lTgt.set_x2(time)
+    s
+
+method kill(Setup s, string why) =>
+    s.state := S_DONE
+    s.note  := why
+    s.freezeLevels()
+    if not na(s.lCe)
+        s.lCe.set_style(line.style_dotted)
+    s
+
+method extendLines(Setup s) =>
+    if s.alive() and not na(s.lCe)
+        s.lCe.set_x2(time)
+        s.lBeg.set_x2(time)
+        s.lExt.set_x2(time)
+        if not na(s.lTgt)
+            s.lTgt.set_x2(time)
+    if s.state == S_TRADE and not na(s.lEntry)
+        s.lEntry.set_x2(bar_index)
+        s.lSL.set_x2(bar_index)
+        s.lTP.set_x2(bar_index)
+        s.bxWin.set_right(bar_index)
+        s.bxLoss.set_right(bar_index)
+    s
+
+f_newSetup(int d, int wt, float beg, float ext, float tgt) =>
+    Setup s = Setup.new(dir = d, state = S_LIQ, wickTime = wt, startTime = time, startBar = bar_index,
+         beg = beg, ce = (beg + ext) / 2, ext = ext, target = tgt, fvgChecked = not useFvgFilt,
+         note = "Waiting for liquidity")
+    if showLevels
+        color c = d == 1 ? colBull : colBear
+        s.lExt := line.new(wt, ext, time, ext, xloc = xloc.bar_time, color = c, width = 1)
+        s.lCe  := line.new(wt, s.ce, time, s.ce, xloc = xloc.bar_time, color = c, width = 2, style = line.style_dashed)
+        s.lBeg := line.new(wt, beg, time, beg, xloc = xloc.bar_time, color = color.new(c, 60), width = 1)
+        if targetMode == TGT_PD
+            s.lTgt := line.new(time, tgt, time, tgt, xloc = xloc.bar_time, color = color.new(c, 30), width = 1, style = line.style_dotted)
+        label.new(wt, ext, "HTF wick CE " + str.tostring(s.ce, format.mintick), xloc = xloc.bar_time,
+             style = d == 1 ? label.style_label_up : label.style_label_down, color = color.new(c, 75),
+             textcolor = chart.fg_color, size = size.tiny)
+    s
+
+// Validate the planned trade and arm a pending limit (entry / SL / TP).
+method placeOrder(Setup s, float entryPx, float stopPx, string route) =>
+    float risk = math.abs(entryPx - stopPx)
+    float tp   = targetMode == TGT_R ? entryPx + s.dir * risk * fixedR : s.target
+    float rr   = risk > 0 ? s.dir * (tp - entryPx) / risk : 0.0
+    bool stopOk = maxStopPts == 0 or risk <= maxStopPts
+    if risk <= 0 or rr < minRR
+        s.kill("Pass: planned R " + str.tostring(rr, "#.##") + " < min")
+    else if not stopOk
+        s.kill("Pass: stop " + str.tostring(risk, "#.##") + " pts too wide")
+    else
+        s.entry    := entryPx
+        s.stop     := stopPx
+        s.tp       := tp
+        s.risk     := risk
+        s.state    := S_ORDER
+        s.orderBar := bar_index
+        s.note     := route + (s.dir == 1 ? " BUY" : " SELL") + " limit pending"
+        color c = s.dir == 1 ? colBull : colBear
+        label.new(bar_index, entryPx, route + (s.dir == 1 ? " BUY LIMIT" : " SELL LIMIT") +
+             "\nEntry " + str.tostring(entryPx, format.mintick) +
+             "\nSL " + str.tostring(stopPx, format.mintick) + " (" + str.tostring(risk, "#.##") + " pts)" +
+             "\nTP " + str.tostring(tp, format.mintick) + " (" + str.tostring(rr, "#.##") + "R)",
+             style = label.style_label_left, color = color.new(c, 40), textcolor = color.white, size = size.small)
+        alert(syminfo.ticker + " " + route + (s.dir == 1 ? " BUY" : " SELL") + " LIMIT " + str.tostring(entryPx, format.mintick) +
+             " | SL " + str.tostring(stopPx, format.mintick) + " | TP " + str.tostring(tp, format.mintick), alert.freq_once_per_bar_close)
+    s
+
+// Close a virtual trade at a price and record the result.
+method closeTrade(Setup s, Stats stt, float px, string why) =>
+    float r = s.dir * (px - s.entry) / s.risk
+    s.state   := S_DONE
+    s.exitBar := bar_index
+    s.result  := why
+    s.note    := why + " " + str.tostring(r, "+#.##;-#.##") + "R"
+    stt.netR := stt.netR + r
+    if r > 0.0001
+        stt.wins := stt.wins + 1
+    else if r < -0.0001
+        stt.losses      := stt.losses + 1
+        stt.lossesToday := stt.lossesToday + 1
+    else
+        stt.scratches := stt.scratches + 1
+    s.lEntry.set_x2(bar_index)
+    s.lSL.set_x2(bar_index)
+    s.lTP.set_x2(bar_index)
+    s.bxWin.set_right(bar_index)
+    s.bxLoss.set_right(bar_index)
+    s.freezeLevels()
+    color c = why == "TP" ? colBull : why == "SL" ? colBear : color.gray
+    label.new(bar_index, px, why + " " + str.tostring(r, "+#.##;-#.##") + "R",
+         style = s.dir == 1 ? (why == "TP" ? label.style_label_down : label.style_label_up) : (why == "TP" ? label.style_label_up : label.style_label_down),
+         color = c, textcolor = color.white, size = size.small)
+    alert(syminfo.ticker + (s.dir == 1 ? " BUY " : " SELL ") + why + " hit @ " + str.tostring(px, format.mintick) +
+         " (" + str.tostring(r, "+#.##;-#.##") + "R)", alert.freq_once_per_bar_close)
+    s
+
+// Advance one setup through its state machine on the current bar.
+method step(Setup s, Stats stt, bool canTrade, bool dayLocked) =>
+    if s.alive()
+        int d = s.dir
+        bool through  = d == -1 ? high > s.ext : low < s.ext
+        bool ceTouch  = d == -1 ? high >= s.ce : low <= s.ce
+        bool tgtTaken = targetMode == TGT_PD and (d == -1 ? low <= s.target : high >= s.target)
+
+        // HTF bookkeeping: age + unfilled-imbalance-origin filter
+        if newHtf and bar_index > s.startBar and s.state < S_ORDER
+            s.htfAge := s.htfAge + 1
+            if s.wickTime == h3T
+                if useFvgFilt and (d == -1 ? h3L > hH : h3H < hL)
+                    s.kill("Excluded: wick begins unfilled imbalance")
+                s.fvgChecked := true
+
+        // invalidation before an order exists
+        if s.state >= S_LIQ and s.state <= S_LTF
+            if through
+                s.kill("Invalid: HTF wick extreme traded through")
+            else if tgtTaken
+                s.kill("Invalid: destination already traded")
+            else if s.state != S_LTF and s.htfAge > maxHtfAge
+                s.kill("Expired")
+
+        // 1) engineered liquidity before CE
+        if s.state == S_LIQ
+            if ceTouch
+                s.kill("Invalid: CE reached before liquidity formed")
+            else
+                float piv = d == -1 ? ph : pl
+                if not na(piv) and pivT >= s.startTime
+                    float dist = d == -1 ? s.ce - piv : piv - s.ce
+                    if dist <= proxPts
+                        s.kill("Excluded: liquidity within " + str.tostring(proxPts) + " pts of CE")
+                    else if dist <= liqMaxDist
+                        s.liqCount := s.liqCount + 1
+                        s.note     := "Liquidity " + str.tostring(s.liqCount) + "/" + str.tostring(minLiq)
+                        if showLevels
+                            label.new(pivT, piv, "$", xloc = xloc.bar_time, style = label.style_none, textcolor = colLiq, size = size.small)
+                if s.state == S_LIQ and s.liqCount >= minLiq
+                    if s.fvgChecked
+                        s.state := S_READY
+                        s.note  := "Qualified"
+                    else
+                        s.note := "Liquidity OK - waiting imbalance check"
+
+        // 2) Setup 1: direct limit at the HTF wick CE, stop beyond the HTF wick extreme
+        if s.state == S_READY
+            if ceTouch
+                s.kill("Missed: CE reached before order placed")
+            else if canTrade
+                s.placeOrder(s.ce, s.ext - d * stopBuf, "S1")
+
+        // 4) pending limit
+        if s.state == S_ORDER and bar_index > s.orderBar
+            bool filled = d == -1 ? high >= s.entry : low <= s.entry
+            if filled
+                s.state   := S_TRADE
+                s.fillBar := bar_index
+                s.note    := "In trade"
+                stt.tradesToday := stt.tradesToday + 1
+                color cw = color.new(colBull, 82)
+                color cl = color.new(colBear, 82)
+                s.lEntry := line.new(bar_index, s.entry, bar_index, s.entry, color = chart.fg_color, width = 1)
+                s.lSL    := line.new(bar_index, s.stop, bar_index, s.stop, color = colBear, width = 2)
+                s.lTP    := line.new(bar_index, s.tp, bar_index, s.tp, color = colBull, width = 2)
+                s.bxWin  := box.new(bar_index, math.max(s.entry, s.tp), bar_index, math.min(s.entry, s.tp), border_color = na, bgcolor = cw)
+                s.bxLoss := box.new(bar_index, math.max(s.entry, s.stop), bar_index, math.min(s.entry, s.stop), border_color = na, bgcolor = cl)
+                label.new(bar_index, d == 1 ? low : high, (d == 1 ? "BUY" : "SELL") +
+                     "\nEntry " + str.tostring(s.entry, format.mintick) +
+                     "\nSL " + str.tostring(s.stop, format.mintick) +
+                     "\nTP " + str.tostring(s.tp, format.mintick),
+                     style = d == 1 ? label.style_label_up : label.style_label_down,
+                     color = d == 1 ? colBull : colBear, textcolor = color.white, size = size.small)
+                alert(syminfo.ticker + (d == 1 ? " BUY" : " SELL") + " filled @ " + str.tostring(s.entry, format.mintick) +
+                     " | SL " + str.tostring(s.stop, format.mintick) + " | TP " + str.tostring(s.tp, format.mintick), alert.freq_once_per_bar_close)
+            else if tgtTaken
+                s.kill("Cancelled: destination traded before fill")
+            else if through
+                s.kill("Cancelled: HTF extreme traded through")
+            else if dayLocked
+                s.kill("Cancelled: daily limit reached")
+            else if bar_index - s.orderBar > orderExp
+                s.kill("Cancelled: limit expired")
+
+        // 5) in trade: stop first (conservative), then target, then break-even
+        if s.state == S_TRADE
+            bool slHit = d == -1 ? high >= s.stop : low <= s.stop
+            bool tpHit = d == -1 ? low <= s.tp : high >= s.tp
+            if slHit
+                s.closeTrade(stt, s.stop, s.beDone ? "BE" : "SL")
+            else if tpHit
+                s.closeTrade(stt, s.tp, "TP")
+            else if beAtR > 0 and not s.beDone and bar_index > s.fillBar
+                float fav = d == 1 ? high - s.entry : s.entry - low
+                if fav >= beAtR * s.risk
+                    s.stop   := s.entry
+                    s.beDone := true
+                    s.lSL.set_y1(s.entry)
+                    s.lSL.set_y2(s.entry)
+                    s.bxLoss.set_top(s.entry)
+                    s.bxLoss.set_bottom(s.entry)
+                    s.note := "In trade - stop at break-even"
+        s.extendLines()
+    s
+
+// ───────────────────────────── Candidate detection on HTF close ─────────────────────────────
+var Setup bear = Setup.new(dir = -1)
+var Setup bull = Setup.new(dir = 1)
+
+if newHtf and not na(hPH) and not na(pdH)
+    float rng = hH - hL
+    // bearish upper wick
+    float bBeg = math.max(hO, hC)
+    float bW   = hH - bBeg
+    bool bOrig = originMode == "Any qualified wick" or (hH > hPH and hC < hPH)
+    bool bEq   = useEqFilt and math.abs(hH - hPH) <= eqTol
+    bool bTgt  = targetMode == TGT_R or (dayLo > pdL and pdL < (bBeg + hH) / 2)
+    if allowShort and rng > 0 and bW >= minWickPts and bW / rng * 100 >= minWickPct and bOrig and not bEq and bTgt
+        if not bear.busy() and bear.state != S_LTF
+            if bear.alive()
+                bear.kill("Replaced by newer wick")
+            bear := f_newSetup(-1, hT, bBeg, hH, pdL)
+    // bullish lower wick
+    float uBeg = math.min(hO, hC)
+    float uW   = uBeg - hL
+    bool uOrig = originMode == "Any qualified wick" or (hL < hPL and hC > hPL)
+    bool uEq   = useEqFilt and math.abs(hL - hPL) <= eqTol
+    bool uTgt  = targetMode == TGT_R or (dayHi < pdH and pdH > (uBeg + hL) / 2)
+    if allowLong and rng > 0 and uW >= minWickPts and uW / rng * 100 >= minWickPct and uOrig and not uEq and uTgt
+        if not bull.busy() and bull.state != S_LTF
+            if bull.alive()
+                bull.kill("Replaced by newer wick")
+            bull := f_newSetup(1, hT, uBeg, hL, pdH)
+
+// ───────────────────────────── Run state machines (one trade at a time) ─────────────────────────────
+bool dayLocked = st.tradesToday >= maxTrades or st.lossesToday >= maxLosses
+bool baseOk    = inSess and not dayLocked
+bear.step(st, baseOk and not bull.busy(), dayLocked)
+bull.step(st, baseOk and not bear.busy(), dayLocked)
+
+// ───────────────────────────── Signals & alerts ─────────────────────────────
+bool buySig  = bull.fillBar == bar_index
+bool sellSig = bear.fillBar == bar_index
+bool tpSig   = (bull.exitBar == bar_index and bull.result == "TP") or (bear.exitBar == bar_index and bear.result == "TP")
+bool slSig   = (bull.exitBar == bar_index and bull.result != "TP") or (bear.exitBar == bar_index and bear.result != "TP")
+
+plotshape(buySig,  "BUY",  shape.triangleup,   location.belowbar, colBull, size = size.small)
+plotshape(sellSig, "SELL", shape.triangledown, location.abovebar, colBear, size = size.small)
+
+alertcondition(buySig,  "BUY signal",  "Wick CE: BUY limit filled")
+alertcondition(sellSig, "SELL signal", "Wick CE: SELL limit filled")
+alertcondition(tpSig,   "Take profit hit", "Wick CE: take profit hit")
+alertcondition(slSig,   "Stop loss / break-even hit", "Wick CE: stop loss hit")
+
+// ───────────────────────────── Visuals ─────────────────────────────
+plot(showPD ? pdH : na, "Prior day high", color = color.new(colBull, 40), style = plot.style_stepline)
+plot(showPD ? pdL : na, "Prior day low",  color = color.new(colBear, 40), style = plot.style_stepline)
+
+f_stateName(Setup s) =>
+    s.state == S_LIQ ? "Waiting liquidity" : s.state == S_READY ? "Qualified" : s.state == S_LTF ? "Waiting LTF rejection" :
+     s.state == S_ORDER ? "Limit pending" : s.state == S_TRADE ? "In trade" : "Idle"
+
+var table tbl = table.new(position.top_right, 2, 7, bgcolor = color.new(chart.bg_color, 10), border_width = 1, border_color = color.gray)
+if showTable and barstate.islast
+    string biasTxt = dailyBias == 1 ? "Bullish" : dailyBias == -1 ? "Bearish" : "Unclear"
+    int    closed  = st.wins + st.losses + st.scratches
+    table.cell(tbl, 0, 0, "Model", text_color = chart.fg_color, text_size = size.small)
+    table.cell(tbl, 1, 0, "WickCE S1", text_color = chart.fg_color, text_size = size.small)
+    table.cell(tbl, 0, 1, "Daily bias", text_color = chart.fg_color, text_size = size.small)
+    table.cell(tbl, 1, 1, biasTxt, text_color = dailyBias == 1 ? colBull : dailyBias == -1 ? colBear : chart.fg_color, text_size = size.small)
+    table.cell(tbl, 0, 2, "Sell setup", text_color = colBear, text_size = size.small)
+    table.cell(tbl, 1, 2, f_stateName(bear) + (bear.note != "" ? " | " + bear.note : ""), text_color = chart.fg_color, text_size = size.small)
+    table.cell(tbl, 0, 3, "Buy setup", text_color = colBull, text_size = size.small)
+    table.cell(tbl, 1, 3, f_stateName(bull) + (bull.note != "" ? " | " + bull.note : ""), text_color = chart.fg_color, text_size = size.small)
+    table.cell(tbl, 0, 4, "Today trades / losses", text_color = chart.fg_color, text_size = size.small)
+    table.cell(tbl, 1, 4, str.tostring(st.tradesToday) + "/" + str.tostring(maxTrades) + "  |  " + str.tostring(st.lossesToday) + "/" + str.tostring(maxLosses), text_color = dayLocked ? color.red : chart.fg_color, text_size = size.small)
+    table.cell(tbl, 0, 5, "Wins / losses / BE", text_color = chart.fg_color, text_size = size.small)
+    table.cell(tbl, 1, 5, str.tostring(st.wins) + " / " + str.tostring(st.losses) + " / " + str.tostring(st.scratches) +
+         (closed > 0 ? "  (" + str.tostring(100.0 * st.wins / closed, "#.#") + "% win)" : ""), text_color = chart.fg_color, text_size = size.small)
+    table.cell(tbl, 0, 6, "Net R (before costs)", text_color = chart.fg_color, text_size = size.small)
+    table.cell(tbl, 1, 6, str.tostring(st.netR, "+#.##;-#.##"), text_color = st.netR >= 0 ? colBull : colBear, text_size = size.small)
