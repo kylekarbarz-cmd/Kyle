@@ -42,3 +42,18 @@ Each indicator shows:
 - A stats table with wins, losses, win % and net R.
 
 Alerts: in TradingView, choose *Create alert → condition: the indicator → "Any alert() function call"*. You can also pick one of the BUY / SELL / Take profit / Stop loss conditions.
+
+### Trade management and more entries (indicators)
+- **Exit plan**: *Partial at target + runner* (default) takes a partial at the draw, moves the stop to break-even and trails the rest. *Runner* has no fixed TP. *Fixed TP* exits everything at the draw.
+- **HOLD / CAUTION / EXIT** status for the open trade (table row "Open trade", plus chart labels and alerts):
+  - HOLD: structure intact.
+  - CAUTION: a higher high (short) or lower low (long) formed against the trade.
+  - EXIT: a candle closed beyond the last swing against the trade.
+- Structural trailing stop. Optional automatic exit on a structure shift after +X R.
+- More entries:
+  - HTF 2 (H1) wicks alongside H4.
+  - "Both if unclear" bias.
+  - London + NY session.
+  - 3 trades per day.
+  - Re-entry after a loss while the wick is still valid.
+  - Setup 1 can enter at the wick beginning.
